@@ -1,0 +1,14 @@
+# JVM sidecar build output
+jvm/owl-agent/out/
+jvm/owl-agent/out-test/
+jvm/owl-agent/owl-agent.jar
+
+# Downloaded JDBC driver / agent jars (see scripts/fetch-jars.sh)
+/*.jar
+/jars/
+
+# Local e2e credentials — never commit
+testdata/db/.local-dev.env
+
+# OS / editor
+.DS_Store
