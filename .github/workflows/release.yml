@@ -1,0 +1,77 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  # 在三大平台各自验证：纯 Go 驱动单测 + JVM sidecar 构建/测试。
+  # sidecar jar 本身与平台无关（Java 8 字节码），故只发布一份；矩阵的意义
+  # 是证明驱动与构建脚本在 macOS/Linux/Windows 上都能跑。
+  verify:
+    name: verify ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # 用 JDK 17 + `--release 8` 产出 Java 8 字节码（javac 的 --release
+      # 自 JDK 9 起才有，故不能用 JDK 8 构建）。
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Go tests
+        shell: bash
+        run: go test ./...
+
+      - name: Build sidecar
+        shell: bash
+        run: bash jvm/owl-agent/build.sh
+
+      - name: Sidecar tests
+        shell: bash
+        run: bash jvm/owl-agent/test.sh
+
+  release:
+    name: release
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Build sidecar
+        run: bash jvm/owl-agent/build.sh
+
+      - name: Checksum
+        run: |
+          cd jvm/owl-agent
+          sha256sum owl-agent.jar > owl-agent.jar.sha256
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${GITHUB_REF#refs/tags/}"
+          gh release create "$TAG" \
+            jvm/owl-agent/owl-agent.jar \
+            jvm/owl-agent/owl-agent.jar.sha256 \
+            --title "$TAG" --generate-notes

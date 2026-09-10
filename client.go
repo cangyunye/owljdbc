@@ -59,7 +59,7 @@ func openAgent(ctx context.Context, cfg Config) (*AgentProc, error) {
 	}
 	cp := cfg.AgentJar
 	for _, j := range cfg.Classpath {
-		cp += ":" + j
+		cp += string(os.PathListSeparator) + j
 	}
 	cmd := exec.Command(java, "-cp", cp, "owl.agent.Main")
 	stdin, err := cmd.StdinPipe()

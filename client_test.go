@@ -3,26 +3,58 @@ package owljdbc
 import (
 	"context"
 	"io"
+	"os"
 	"os/exec"
-	"syscall"
+	"path/filepath"
+	"runtime"
+	"sync"
 	"testing"
 )
 
-// killProcGroup 杀掉整个进程组。`go run` 会派生一个真正的子进程，
-// 仅杀 wrapper（cmd.Process）不会关闭子进程持有的 stdout 管道，
-// 因此必须按进程组 SIGKILL，readLoop 才能读到 EOF 并标记进程死亡。
-func killProcGroup(cmd *exec.Cmd) {
-	if cmd.Process == nil {
-		return
+// fakeAgentBinary 构建一次 fake sidecar 二进制并复用。直接 exec 该二进制
+// （而非 `go run`）使 cmd.Process 就是真正的 agent，Kill 它即可关闭 stdout
+// 管道让 readLoop 读到 EOF——无需进程组，macOS/Linux/Windows 行为一致。
+var (
+	fakeAgentOnce sync.Once
+	fakeAgentPath string
+	fakeAgentErr  error
+)
+
+func fakeAgentBinary(t *testing.T) string {
+	t.Helper()
+	fakeAgentOnce.Do(func() {
+		dir, err := os.MkdirTemp("", "owljdbc-fake-agent")
+		if err != nil {
+			fakeAgentErr = err
+			return
+		}
+		bin := filepath.Join(dir, "fake_agent")
+		if runtime.GOOS == "windows" {
+			bin += ".exe"
+		}
+		cmd := exec.Command("go", "build", "-o", bin, "./testdata/fake_agent")
+		cmd.Stderr = os.Stderr
+		if err := cmd.Run(); err != nil {
+			fakeAgentErr = err
+			return
+		}
+		fakeAgentPath = bin
+	})
+	if fakeAgentErr != nil {
+		t.Fatalf("build fake agent: %v", fakeAgentErr)
 	}
-	_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-	_ = cmd.Process.Kill()
+	return fakeAgentPath
+}
+
+func killProc(cmd *exec.Cmd) {
+	if cmd.Process != nil {
+		_ = cmd.Process.Kill()
+	}
 }
 
 func newTestProc(t *testing.T) *AgentProc {
 	t.Helper()
-	cmd := exec.Command("go", "run", "./testdata/fake_agent")
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd := exec.Command(fakeAgentBinary(t))
 	stdin, _ := cmd.StdinPipe()
 	stdout, _ := cmd.StdoutPipe()
 	stderr, _ := cmd.StderrPipe()
@@ -40,7 +72,8 @@ func newTestProc(t *testing.T) *AgentProc {
 	}
 	go p.readLoop()
 	go p.logLoop(stderr)
-	t.Cleanup(func() { killProcGroup(cmd) })
+	go func() { _ = cmd.Wait() }()
+	t.Cleanup(func() { killProc(cmd) })
 	return p
 }
 
@@ -115,7 +148,7 @@ func TestSessionProcessDeath(t *testing.T) {
 		t.Fatal(err)
 	}
 	// 杀进程 → 下一次 Exec 应立即报错，不挂起。
-	killProcGroup(proc.cmd)
+	killProc(proc.cmd)
 	_, err = s.Exec(context.Background(), ControlRequest{Op: "PING"}, nil)
 	if err == nil {
 		t.Fatalf("expected error after process death")
