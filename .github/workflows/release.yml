@@ -40,7 +40,13 @@ jobs:
 
       - name: Build sidecar
         shell: bash
-        run: bash jvm/owl-agent/build.sh
+        run: |
+          if ! out=$(bash jvm/owl-agent/build.sh 2>&1); then
+            printf '%s\n' "$out"
+            echo "::error::build.sh failed: $(printf '%s' "$out" | tr '\n' '|' | tail -c 800)"
+            exit 1
+          fi
+          printf '%s\n' "$out"
 
       - name: Sidecar tests
         shell: bash
