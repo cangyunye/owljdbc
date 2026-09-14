@@ -79,54 +79,72 @@ public final class Main {
                 }
                 case "QUERY": {
                     Session s = SESSIONS.get(req.conn);
-                    ResultSet rs = null;
-                    Statement ps = null;
                     boolean headerSent = false;
                     String err = null;
                     long rows = 0;
-                    try {
-                        rs = s.query(req.sql, req.family, req.args);
-                        ps = rs.getStatement();
-                        ResultSetMetaData md = rs.getMetaData();
-                        StringBuilder cols = new StringBuilder("[");
-                        for (int i = 1; i <= md.getColumnCount(); i++) {
-                            if (i > 1) cols.append(',');
-                            // 常量列（如 information_schema 查询里的 '' / 'SQL'）的
-                            // label/typeName 可能为 null（Connector/J 实测），必须兜底。
-                            String label = md.getColumnLabel(i);
-                            String typeName = md.getColumnTypeName(i);
-                            cols.append("{\"name\":\"").append(Json.escape(label == null ? "" : label))
-                                .append("\",\"type\":\"").append(Json.escape(typeName == null ? "" : typeName)).append("\"}");
-                        }
-                        cols.append(']');
-                        sendRespRaw(out, req, true, cols.toString(), null, 0, 0);
-                        headerSent = true;
-                        int nCols = md.getColumnCount();
-                        while (rs.next()) {
-                            // 先把整行编码进字节数组，再按 12 字节头 + 行负载精确分配缓冲
-                            java.io.ByteArrayOutputStream row = new java.io.ByteArrayOutputStream();
-                            for (int i = 1; i <= nCols; i++) {
-                                row.write(ValueCodec.encodeValue(columnValue(rs, md, i, req.family)));
+                    // ojdbc 对 LONG 分段流的跨语句状态清理并不干净：close 提前到
+                    // 完成帧之前（消除并发误关）之后，真 Oracle 上 LONG 查询仍会
+                    // 偶发 ORA-17027「流已被关闭」（Oracle 26ai Free + ojdbc8 实测
+                    // 最小复现 ~20%，重 LONG 场景更高），且必然被下一条查询自愈。
+                    // 未发出任何行时原地重试一次吸收该缺陷；已出行的多行流无法
+                    // 安全重试（会向客户端发重复行），仍照常报错。
+                    for (int attempt = 1; ; attempt++) {
+                        ResultSet rs = null;
+                        Statement ps = null;
+                        try {
+                            rs = s.query(req.sql, req.family, req.args);
+                            ps = rs.getStatement();
+                            ResultSetMetaData md = rs.getMetaData();
+                            StringBuilder cols = new StringBuilder("[");
+                            for (int i = 1; i <= md.getColumnCount(); i++) {
+                                if (i > 1) cols.append(',');
+                                // 常量列（如 information_schema 查询里的 '' / 'SQL'）的
+                                // label/typeName 可能为 null（Connector/J 实测），必须兜底。
+                                String label = md.getColumnLabel(i);
+                                String typeName = md.getColumnTypeName(i);
+                                cols.append("{\"name\":\"").append(Json.escape(label == null ? "" : label))
+                                    .append("\",\"type\":\"").append(Json.escape(typeName == null ? "" : typeName)).append("\"}");
                             }
-                            byte[] rowBytes = row.toByteArray();
-                            ByteBuffer bb = ByteBuffer.allocate(12 + rowBytes.length).order(ByteOrder.LITTLE_ENDIAN);
-                            bb.putInt(req.conn);
-                            bb.putInt(req.id);
-                            bb.putInt(1);
-                            bb.put(rowBytes);
-                            Protocol.writeFrame(out, Protocol.ROW_BATCH, bb.array());
-                            rows++;
+                            cols.append(']');
+                            if (!headerSent) {
+                                sendRespRaw(out, req, true, cols.toString(), null, 0, 0);
+                                headerSent = true;
+                            }
+                            int nCols = md.getColumnCount();
+                            while (rs.next()) {
+                                // 先把整行编码进字节数组，再按 12 字节头 + 行负载精确分配缓冲
+                                java.io.ByteArrayOutputStream row = new java.io.ByteArrayOutputStream();
+                                for (int i = 1; i <= nCols; i++) {
+                                    row.write(ValueCodec.encodeValue(columnValue(rs, md, i, req.family)));
+                                }
+                                byte[] rowBytes = row.toByteArray();
+                                ByteBuffer bb = ByteBuffer.allocate(12 + rowBytes.length).order(ByteOrder.LITTLE_ENDIAN);
+                                bb.putInt(req.conn);
+                                bb.putInt(req.id);
+                                bb.putInt(1);
+                                bb.put(rowBytes);
+                                Protocol.writeFrame(out, Protocol.ROW_BATCH, bb.array());
+                                rows++;
+                            }
+                            break;
+                        } catch (Exception e) {
+                            if (attempt == 1 && rows == 0 && e.getMessage() != null
+                                && e.getMessage().contains("ORA-17027")) {
+                                System.err.println("[owl-agent] ORA-17027 (stream) on conn=" + req.conn
+                                    + ", no rows sent; retrying once");
+                                continue;
+                            }
+                            err = e.getMessage() != null ? e.getMessage() : e.toString();
+                            break;
+                        } finally {
+                            // 必须先释放 JDBC 资源再回完成包：客户端收到 END 即会发下一条
+                            // QUERY，而本 handler 跑在线程池里，若 close 与下一条的 execute
+                            // 在同一连接上并发，Oracle 的 LONG 分段流会被误关
+                            // （实测大于约 20 字节的 LONG 值必现 ORA-17027 流已被关闭）。
+                            try { if (rs != null) rs.close(); } catch (Exception ignored) { }
+                            try { if (ps != null) ps.close(); } catch (Exception ignored) { }
+                            if (s != null) s.clearCurrent();
                         }
-                    } catch (Exception e) {
-                        err = e.getMessage() != null ? e.getMessage() : e.toString();
-                    } finally {
-                        // 必须先释放 JDBC 资源再回完成包：客户端收到 END 即会发下一条
-                        // QUERY，而本 handler 跑在线程池里，若 close 与下一条的 execute
-                        // 在同一连接上并发，Oracle 的 LONG 分段流会被误关
-                        // （实测大于约 20 字节的 LONG 值必现 ORA-17027 流已被关闭）。
-                        try { if (rs != null) rs.close(); } catch (Exception ignored) { }
-                        try { if (ps != null) ps.close(); } catch (Exception ignored) { }
-                        if (s != null) s.clearCurrent();
                     }
                     // 表头已发出后 Go 端 pending[id] 已删除：错误 RESPONSE 无人接收，
                     // 必须以 END(ok:false) 收尾，否则 Go 的 Next() 永久阻塞。
