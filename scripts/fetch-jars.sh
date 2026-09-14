@@ -18,5 +18,7 @@ fetch org/postgresql/postgresql/42.7.13/postgresql-42.7.13.jar \
       postgresql-42.7.13.jar
 fetch com/oceanbase/oceanbase-client/2.4.1/oceanbase-client-2.4.1.jar \
       oceanbase-client-2.4.1.jar
+fetch com/oracle/database/jdbc/ojdbc8/23.26.3.0.0/ojdbc8-23.26.3.0.0.jar \
+      ojdbc8-23.26.3.0.0.jar
 
 echo "done. 用法：owljdbc.Config.Classpath 指向这些 jar；jars_dir 指向本目录。"

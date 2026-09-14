@@ -10,6 +10,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
+	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -21,26 +25,96 @@ import (
 // 天然免疫，必须在真库上固化。
 //
 // 环境变量（OS env > testdata/db/.local-dev.env，每行 export KEY='value'）：
-//   OWL_E2E_OB_ORACLE_MIGSRC_DSN  OB Oracle 租户（只读即可）：repro / 连查循环
-//   OWL_E2E_OB_ORACLE_TEST_DSN    可写租户（建删 OWL_E2E_LV_ 前缀临时表）：大文本 / 错误恢复
-// DSN 形如 oceanbase-oracle://USER@TENANT:PASS%40WORD@host:port/（密码百分号编码）。
+//   OWL_E2E_ORACLE_DSN            真 Oracle，oracle://user:pass@host:port/服务名
+//   OWL_E2E_MYSQL_DSN             MySQL，mysql://user:pass@host:port/库
+//   OWL_E2E_PG_DSN                PostgreSQL，postgresql://user:pass@host:port/库
+//   OWL_E2E_OB_ORACLE_MIGSRC_DSN  OB Oracle 租户（只读即可）
+//   OWL_E2E_OB_ORACLE_TEST_DSN    OB 可写租户（建删 OWL_E2E_LV_ 前缀临时表）
+// Oracle 用例按 真 Oracle > OB 租户 的顺序取第一个非空 DSN；密码按 URL 百分号编码。
 
 // ── 通用 helper ──
 
-// openOracleE2E 打开指向 OB Oracle 租户的连接池，未配置对应 DSN 则 skip。
-func openOracleE2E(t *testing.T, env map[string]string, dsnKey string) *sql.DB {
+// parseURLDSN 解析 scheme://user:pass@host:port/db 形式的 URL DSN，返回连接
+// 凭证与库名/服务名（密码按 URL 百分号解码）。
+func parseURLDSN(t *testing.T, dsn string) (jdbcCred, string) {
 	t.Helper()
-	dsn := lookupEnv(env, dsnKey)
-	if dsn == "" {
-		t.Skipf("set %s (or testdata/db/.local-dev.env)", dsnKey)
+	u, err := url.Parse(dsn)
+	if err != nil || u.Host == "" || u.User == nil {
+		t.Fatalf("bad url dsn %q: %v", dsn, err)
 	}
-	cred := parseOracleURLDSN(t, dsn)
-	db, err := sql.Open("owljdbc", EncodeDSN(e2eAgentCfg(t, "oracle", cred.User, cred.Password, cred.Host, cred.Port)))
+	pass, _ := u.User.Password() // 原始百分号编码形式，需手动解码
+	if dec, err := url.PathUnescape(pass); err == nil {
+		pass = dec
+	}
+	port := u.Port()
+	if port == "" {
+		t.Fatalf("url dsn %q missing port", dsn)
+	}
+	var portNum int
+	fmt.Sscanf(port, "%d", &portNum)
+	return jdbcCred{User: u.User.Username(), Password: pass, Host: u.Hostname(), Port: portNum},
+		strings.TrimPrefix(u.Path, "/")
+}
+
+// buildProfileCfg 用生产 catalog profile 组装连接配置；驱动 jar / agent jar
+// 缺失按环境未就绪处理（skip），与既有 e2eAgentCfg 的语义一致。
+func buildProfileCfg(t *testing.T, dbType, dsn string) Config {
+	t.Helper()
+	cred, database := parseURLDSN(t, dsn)
+	agentJar := os.Getenv("OWL_AGENT_JAR")
+	if agentJar == "" {
+		agentJar = filepath.Join("jvm", "owl-agent", "owl-agent.jar")
+	}
+	cfg, err := BuildConfig(dbType, Endpoint{
+		Host: cred.Host, Port: strconv.Itoa(cred.Port),
+		User: cred.User, Password: cred.Password, Database: database,
+	}, "", ".", agentJar, "")
+	if err != nil {
+		t.Skipf("build %s config (driver jar missing?): %v", dbType, err)
+	}
+	return cfg
+}
+
+func openWithCfg(t *testing.T, cfg Config) *sql.DB {
+	t.Helper()
+	db, err := sql.Open("owljdbc", EncodeDSN(cfg))
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { db.Close() })
 	return db
+}
+
+// openOracleE2E 依次尝试 dsnKeys，第一个非空的生效：oracle:// 走生产 catalog
+// profile（真 Oracle），oceanbase-oracle:// 走既有 e2eAgentCfg（OB 租户）。
+func openOracleE2E(t *testing.T, env map[string]string, dsnKeys ...string) *sql.DB {
+	t.Helper()
+	for _, key := range dsnKeys {
+		dsn := lookupEnv(env, key)
+		if dsn == "" {
+			continue
+		}
+		if strings.HasPrefix(dsn, "oceanbase-oracle://") {
+			cred := parseOracleURLDSN(t, dsn)
+			return openWithCfg(t, e2eAgentCfg(t, "oracle", cred.User, cred.Password, cred.Host, cred.Port))
+		}
+		return openWithCfg(t, buildProfileCfg(t, "oracle", dsn))
+	}
+	t.Skipf("set one of %v (or testdata/db/.local-dev.env)", dsnKeys)
+	return nil
+}
+
+// openFamilyE2E 打开 mysql/postgres 等仅支持 URL 风格 DSN 的连接池，
+// 依次尝试 dsnKeys，第一个非空的生效。
+func openFamilyE2E(t *testing.T, env map[string]string, dbType string, dsnKeys ...string) *sql.DB {
+	t.Helper()
+	for _, key := range dsnKeys {
+		if dsn := lookupEnv(env, key); dsn != "" {
+			return openWithCfg(t, buildProfileCfg(t, dbType, dsn))
+		}
+	}
+	t.Skipf("set one of %v (or testdata/db/.local-dev.env)", dsnKeys)
+	return nil
 }
 
 // pinnedConn 钉住一条物理连接：一个 *sql.Conn 对应 agent 侧一个 Session/conn-id，
@@ -185,7 +259,7 @@ func queryDataDefault(ctx context.Context, conn *sql.Conn, c longDefaultCol) (st
 
 func TestE2E_AgentOBOracleLongSameConnRepro(t *testing.T) {
 	env := devEnvMap()
-	db := openOracleE2E(t, env, "OWL_E2E_OB_ORACLE_MIGSRC_DSN")
+	db := openOracleE2E(t, env, "OWL_E2E_ORACLE_DSN", "OWL_E2E_OB_ORACLE_MIGSRC_DSN")
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	conn := pinnedConn(t, db)
@@ -227,7 +301,7 @@ func TestE2E_AgentOBOracleLongSameConnRepro(t *testing.T) {
 
 func TestE2E_AgentOBOracleLongLargeIntegrity(t *testing.T) {
 	env := devEnvMap()
-	db := openOracleE2E(t, env, "OWL_E2E_OB_ORACLE_TEST_DSN")
+	db := openOracleE2E(t, env, "OWL_E2E_ORACLE_DSN", "OWL_E2E_OB_ORACLE_TEST_DSN")
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 
@@ -291,7 +365,7 @@ func TestE2E_AgentOBOracleLongLargeIntegrity(t *testing.T) {
 
 func TestE2E_AgentOBOracleMidStreamErrorRecovery(t *testing.T) {
 	env := devEnvMap()
-	db := openOracleE2E(t, env, "OWL_E2E_OB_ORACLE_TEST_DSN")
+	db := openOracleE2E(t, env, "OWL_E2E_ORACLE_DSN", "OWL_E2E_OB_ORACLE_TEST_DSN")
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
@@ -344,7 +418,7 @@ func TestE2E_AgentOBOracleMidStreamErrorRecovery(t *testing.T) {
 
 func TestE2E_AgentOBOracleSameConnLoop(t *testing.T) {
 	env := devEnvMap()
-	db := openOracleE2E(t, env, "OWL_E2E_OB_ORACLE_MIGSRC_DSN")
+	db := openOracleE2E(t, env, "OWL_E2E_ORACLE_DSN", "OWL_E2E_OB_ORACLE_MIGSRC_DSN")
 	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
 	defer cancel()
 	conn := pinnedConn(t, db)
@@ -377,4 +451,101 @@ func TestE2E_AgentOBOracleSameConnLoop(t *testing.T) {
 		}
 	}
 	t.Logf("OK: %d sequential queries on one conn (%d LONG interleaved)", total, total/5)
+}
+
+// ── P1：MySQL / PostgreSQL 的同连接顺序查询、错误前奏、空结果集、多连接 ──
+
+type familySuite struct {
+	bindQ  string // 带一个整数占位符（JDBC ? 风格）
+	errQ   string // 语法错误查询（header 前失败）
+	emptyQ string // 恒空结果集
+	okQ    string // 无 FROM 的普通查询
+}
+
+func sameConnSuite(t *testing.T, db *sql.DB, s familySuite) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
+	defer cancel()
+
+	// 单连接 60 条顺序查询（完成帧时序的窗口）
+	conn := pinnedConn(t, db)
+	for i := 0; i < 60; i++ {
+		var n int64
+		if err := conn.QueryRowContext(ctx, s.bindQ, int64(i)).Scan(&n); err != nil {
+			t.Fatalf("iter %d: %v", i, err)
+		}
+		if n != int64(i) {
+			t.Fatalf("iter %d: got %d", i, n)
+		}
+	}
+	t.Log("OK: 60 sequential queries on one conn")
+
+	// 错误前奏：语法错误 → RESPONSE(ok:false)，后续查询正常
+	if _, err := conn.QueryContext(ctx, s.errQ); err == nil {
+		t.Fatal("expected syntax error")
+	}
+	var v string
+	if err := conn.QueryRowContext(ctx, s.okQ).Scan(&v); err != nil {
+		t.Fatalf("query after syntax error: %v", err)
+	}
+	if v != "AFTER_ERR" {
+		t.Fatalf("got %q", v)
+	}
+	t.Log("OK: query after syntax error")
+
+	// 空结果集：END(rows=0) 正常返回
+	rows, err := conn.QueryContext(ctx, s.emptyQ)
+	if err != nil {
+		t.Fatalf("empty query: %v", err)
+	}
+	count := 0
+	for rows.Next() {
+		count++
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	rows.Close()
+	if count != 0 {
+		t.Fatalf("empty query returned %d rows", count)
+	}
+	t.Log("OK: empty result set")
+
+	// 双连接交错：互不串扰
+	c2 := pinnedConn(t, db)
+	for i := 0; i < 6; i++ {
+		var a, b int64
+		if err := conn.QueryRowContext(ctx, s.bindQ, int64(i)).Scan(&a); err != nil {
+			t.Fatalf("conn1 iter %d: %v", i, err)
+		}
+		if err := c2.QueryRowContext(ctx, s.bindQ, int64(1000+i)).Scan(&b); err != nil {
+			t.Fatalf("conn2 iter %d: %v", i, err)
+		}
+		if a != int64(i) || b != int64(1000+i) {
+			t.Fatalf("conn bleed at iter %d: conn1=%d conn2=%d", i, a, b)
+		}
+	}
+	t.Log("OK: two conns interleaved without bleed")
+}
+
+func TestE2E_AgentMySQLSameConn(t *testing.T) {
+	env := devEnvMap()
+	db := openFamilyE2E(t, env, "mysql", "OWL_E2E_MYSQL_DSN")
+	sameConnSuite(t, db, familySuite{
+		bindQ:  "SELECT ?",
+		errQ:   "SELEC 1",
+		emptyQ: "SELECT 1 FROM DUAL WHERE 1=0",
+		okQ:    "SELECT 'AFTER_ERR'",
+	})
+}
+
+func TestE2E_AgentPGSameConn(t *testing.T) {
+	env := devEnvMap()
+	db := openFamilyE2E(t, env, "postgres", "OWL_E2E_PG_DSN")
+	sameConnSuite(t, db, familySuite{
+		bindQ:  "SELECT ?",
+		errQ:   "SELEC 1",
+		emptyQ: "SELECT 1 WHERE FALSE",
+		okQ:    "SELECT 'AFTER_ERR'",
+	})
 }
