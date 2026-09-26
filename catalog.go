@@ -242,3 +242,30 @@ func findFile(dirs []string, pattern string) (string, error) {
 	}
 	return "", fmt.Errorf("no jar matching %s in %v", pattern, dirs)
 }
+
+// FindProfileJars locates the first driver jar matching the profile's globs
+// in dirs. Pure presence probe for capability reporting — no download, no
+// side effects; use EnsureAgentJar for the provisioning path.
+func FindProfileJars(dbType string, dirs []string) (string, bool) {
+	prof, ok := ProfileFor(dbType)
+	if !ok {
+		return "", false
+	}
+	jars, err := ResolveDriverJars(dirs, prof.JarGlobs)
+	if err != nil || len(jars) == 0 {
+		return "", false
+	}
+	return jars[0], true
+}
+
+// ProfileTypes lists every database type that has a catalog profile, sorted.
+// Capability reporters union this with their native type list so agent-only
+// types (dm, kingbase, timesten, …) are visible too.
+func ProfileTypes() []string {
+	out := make([]string, 0, len(profiles))
+	for t := range profiles {
+		out = append(out, t)
+	}
+	sort.Strings(out)
+	return out
+}

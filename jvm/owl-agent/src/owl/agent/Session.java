@@ -70,6 +70,13 @@ public final class Session {
             else if (v instanceof Integer) ps.setInt(i + 1, (Integer) v);
             else if (v instanceof Double) ps.setDouble(i + 1, (Double) v);
             else if (v instanceof Boolean) ps.setBoolean(i + 1, (Boolean) v);
+            else if (v instanceof DateTimeValue) {
+                // naive 时间戳：用编码端偏移渲染墙钟，避免 JVM 本地时区漂移
+                // （如 UTC naive 00:00 落到 +08 库变成 08:00）。
+                DateTimeValue d = (DateTimeValue) v;
+                ps.setTimestamp(i + 1, d.ts, java.util.Calendar.getInstance(d.tz()));
+            }
+            else if (v instanceof java.sql.Timestamp) ps.setTimestamp(i + 1, (java.sql.Timestamp) v);
             else if (v instanceof byte[]) ps.setBytes(i + 1, (byte[]) v);
             else ps.setString(i + 1, String.valueOf(v));
         }

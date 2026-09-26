@@ -18,9 +18,9 @@ public final class ValueCodec {
         if (v == null) return tag(NULL);
         if (v instanceof Boolean) return bytes(tag(BOOL), new byte[]{(byte)(((Boolean) v) ? 1 : 0)});
         if (v instanceof Integer) return longBytes(INT64, ((Integer) v).longValue());
-        if (v instanceof Long) return longBytes(INT64, (Long) v);
+        if (v instanceof Long) return longBytes(INT64, ((Long) v).longValue());
         if (v instanceof Float) return doubleBytes(FLOAT64, ((Float) v).doubleValue());
-        if (v instanceof Double) return doubleBytes(FLOAT64, (Double) v);
+        if (v instanceof Double) return doubleBytes(FLOAT64, ((Double) v).doubleValue());
         if (v instanceof BigDecimal) return textBytes(DECIMAL, ((BigDecimal) v).toPlainString());
         if (v instanceof Timestamp) return encodeDatetime((Timestamp) v);
         if (v instanceof Date) {                       // DATE → DATETIME（午夜），Go 侧还原 time.Time 保证导出对拍一致
@@ -29,6 +29,27 @@ public final class ValueCodec {
             return encodeDatetime(ts);
         }
         if (v instanceof Time) return textBytes(TIME, ((Time) v).toString());
+        if (v instanceof java.sql.Clob) {              // DM/Oracle 驱动对 CLOB 列返回 Clob 对象，
+            java.sql.Clob c = (java.sql.Clob) v;       // toString 是对象地址而非内容——读出文本。
+            try {
+                long len = c.length();
+                String s = len == 0 ? "" : c.getSubString(1, (int) Math.min(len, 16L * 1024 * 1024));
+                return textBytes(STRING, s);
+            } catch (java.sql.SQLException e) {
+                return tag(NULL);
+            }
+        }
+        if (v instanceof java.sql.Blob) {
+            java.sql.Blob b = (java.sql.Blob) v;
+            try {
+                long len = b.length();
+                byte[] out = len == 0 ? new byte[0]
+                    : b.getBytes(1, (int) Math.min(len, 16L * 1024 * 1024));
+                return bytes(tag(BYTES), concat(intBytes(out.length), out));
+            } catch (java.sql.SQLException e) {
+                return tag(NULL);
+            }
+        }
         if (v instanceof byte[]) {
             byte[] b = (byte[]) v;
             return bytes(tag(BYTES), concat(intBytes(b.length), b));
@@ -36,7 +57,7 @@ public final class ValueCodec {
         return textBytes(STRING, String.valueOf(v));
     }
 
-    /** DATETIME：tag + 8B epoch millis LE + 2B tz minutes int16 LE（与 Go decodeValue 对齐）。 */
+    /** DATETIME：tag + 8B epoch millis LE + 2B tz minutes int16 LE + 4B nanos LE（与 Go decodeValue 对齐）。 */
     public static byte[] encodeDatetime(Timestamp ts) {
         int offsetMinutes;
         java.util.TimeZone tz = java.util.TimeZone.getDefault();
@@ -45,10 +66,11 @@ public final class ValueCodec {
     }
 
     public static byte[] encodeDatetime(Timestamp ts, int offsetMinutes) {
-        ByteBuffer bb = ByteBuffer.allocate(11).order(ByteOrder.LITTLE_ENDIAN);
+        ByteBuffer bb = ByteBuffer.allocate(15).order(ByteOrder.LITTLE_ENDIAN);
         bb.put((byte) DATETIME);
         bb.putLong(ts.getTime());
         bb.putShort((short) offsetMinutes);
+        bb.putInt(ts.getNanos());
         return bb.array();
     }
 

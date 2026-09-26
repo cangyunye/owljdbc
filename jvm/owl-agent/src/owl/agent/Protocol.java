@@ -88,10 +88,12 @@ public final class Protocol {
             case ValueCodec.DATETIME: {
                 long millis = bb.getLong();
                 short tzMin = bb.getShort();
+                int nanos = bb.getInt();          // 亚毫秒纳秒（Go 侧 encodeValue 追加）
                 Timestamp ts = new Timestamp(millis);
-                ts.setNanos(0);
-                // 时区语义保留给 Go 侧（Go decodeValue 自行还原 offset），此处仅承载 millis。
-                return ts;
+                ts.setNanos(nanos % 1_000_000);
+                // 墙钟语义：偏移随值携带，绑定用同一偏移渲染（DateTimeValue），
+                // 结果侧由 Go decodeValue 用偏移还原 wall clock。
+                return new DateTimeValue(ts, tzMin);
             }
             default: return null;
         }

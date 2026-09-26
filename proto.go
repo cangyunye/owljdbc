@@ -132,7 +132,11 @@ func encodeValue(buf []byte, v any) []byte {
 		minutes := int16(off / 60)
 		var zb [2]byte
 		binary.LittleEndian.PutUint16(zb[:], uint16(minutes))
-		return append(buf, zb[:]...)
+		buf = append(buf, zb[:]...)
+		// 亚毫秒纳秒（TIMESTAMP(6) 保真；Java 侧 setNanos 还原）。
+		var nb [4]byte
+		binary.LittleEndian.PutUint32(nb[:], uint32(x.Nanosecond()))
+		return append(buf, nb[:]...)
 	default:
 		panic(fmt.Sprintf("encodeValue: unsupported %T", v))
 	}
@@ -175,17 +179,18 @@ func decodeValue(b []byte) (any, int, error) {
 		}
 		return string(payload), 5 + n, nil
 	case tagDatetime:
-		if len(b) < 11 {
+		if len(b) < 15 {
 			return nil, 0, errors.New("short datetime")
 		}
 		ms := int64(binary.LittleEndian.Uint64(b[1:]))
 		minutes := int16(binary.LittleEndian.Uint16(b[9:11]))
-		t := time.UnixMilli(ms)
+		nanos := int32(binary.LittleEndian.Uint32(b[11:15]))
+		t := time.Unix(0, ms*int64(time.Millisecond)+int64(nanos%1_000_000)*int64(time.Nanosecond))
 		if minutes == 0 {
-			return t.UTC(), 11, nil
+			return t.UTC(), 15, nil
 		}
 		loc := time.FixedZone("", int(minutes)*60)
-		return t.In(loc), 11, nil
+		return t.In(loc), 15, nil
 	default:
 		return nil, 0, fmt.Errorf("unknown tag %d", tag)
 	}
