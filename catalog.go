@@ -142,12 +142,16 @@ var profiles = map[string]Profile{
 // ProfileFor 返回数据库类型对应的接入 profile；dbType 需为调用方归一化后
 // 的类型（模块不感知各项目的类型别名归一化规则）。
 func ProfileFor(dbType string) (Profile, bool) {
+	specMu.RLock()
+	defer specMu.RUnlock()
 	p, ok := profiles[strings.ToLower(strings.TrimSpace(dbType))]
 	return p, ok
 }
 
 // HasProfile 报告该类型是否可经 owljdbc 通道接入。
 func HasProfile(dbType string) bool {
+	specMu.RLock()
+	defer specMu.RUnlock()
 	_, ok := profiles[strings.ToLower(strings.TrimSpace(dbType))]
 	return ok
 }
@@ -262,6 +266,8 @@ func FindProfileJars(dbType string, dirs []string) (string, bool) {
 // Capability reporters union this with their native type list so agent-only
 // types (dm, kingbase, timesten, …) are visible too.
 func ProfileTypes() []string {
+	specMu.RLock()
+	defer specMu.RUnlock()
 	out := make([]string, 0, len(profiles))
 	for t := range profiles {
 		out = append(out, t)
