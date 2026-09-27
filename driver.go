@@ -48,7 +48,7 @@ type Conn struct {
 }
 
 func (c *Conn) Prepare(query string) (driver.Stmt, error) {
-	return &Stmt{conn: c, query: query}, nil
+	return &Stmt{conn: c, query: c.adaptSQL(query)}, nil
 }
 
 func (c *Conn) Close() error {
@@ -70,7 +70,7 @@ func (c *Conn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.Tx, e
 }
 
 func (c *Conn) ExecContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
-	resp, err := c.sess.Exec(ctx, ControlRequest{Op: "EXEC", SQL: query, Family: c.sess.family}, toAny(args))
+	resp, err := c.sess.Exec(ctx, ControlRequest{Op: "EXEC", SQL: c.adaptSQL(query), Family: c.sess.family}, toAny(args))
 	if err != nil {
 		return nil, err
 	}
@@ -81,7 +81,7 @@ func (c *Conn) ExecContext(ctx context.Context, query string, args []driver.Name
 }
 
 func (c *Conn) QueryContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
-	qs, err := c.sess.Query(ctx, ControlRequest{Op: "QUERY", SQL: query, Family: c.sess.family}, toAny(args))
+	qs, err := c.sess.Query(ctx, ControlRequest{Op: "QUERY", SQL: c.adaptSQL(query), Family: c.sess.family}, toAny(args))
 	if err != nil {
 		return nil, err
 	}
